@@ -1216,11 +1216,16 @@ name = "webscrack"
 version = "0.2.0"
 dependencies = [
  "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
  "oxc_codegen",
  "oxc_minifier",
  "oxc_parser",
+ "oxc_semantic",
  "oxc_span",
+ "oxc_syntax",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]

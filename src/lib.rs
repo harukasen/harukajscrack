@@ -1,11 +1,16 @@
-use oxc_allocator::Allocator;
+use oxc_allocator::{Allocator, ArenaVec, GetAllocator, ReplaceWith};
+use oxc_ast::{ast::*, builder::AstBuilder};
+use oxc_ast_visit::VisitJsMut;
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_minifier::{Minifier, MinifierOptions};
 use oxc_parser::{ParseOptions, Parser};
-use oxc_span::SourceType;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::{GetSpan, SourceType};
 use pyo3::exceptions::{PyIOError, PySyntaxError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,25 +31,197 @@ fn source_type_for(filename: Option<&str>, source_type: &str) -> PyResult<Source
     }
 }
 
-/// Safe, syntax-preserving cleanup passes corresponding to upstream webcrack's
-/// unminify stage. Oxc then performs the structural pretty-printing.
-fn unminify_source(mut source: String) -> String {
-    for (from, to) in [
-        ("!0", "true"),
-        ("!1", "false"),
-        ("void 0", "undefined"),
-        ("typeof undefined", "typeof void 0"),
-    ] {
-        source = source.replace(from, to);
+/// AST-only safe subset of webcrack's unminify stage.
+///
+/// In particular, this deliberately does not operate on source text: strings,
+/// comments, regular expressions, and formatting are therefore never rewritten.
+/// The pass is conservative around bindings whose global meaning can be changed
+/// by a local declaration (undefined, Infinity, and JSON).
+struct LiteralUnminifier<'a> {
+    builder: AstBuilder<'a>,
+    shadowed: HashSet<String>,
+}
+
+impl<'a> LiteralUnminifier<'a> {
+    fn new(allocator: &'a Allocator, shadowed: HashSet<String>) -> Self {
+        Self { builder: AstBuilder::new(allocator), shadowed }
     }
-    source
+
+    fn identifier(&self, span: oxc_span::Span, name: &str) -> Expression<'a> {
+        Expression::new_identifier(span, self.builder.allocator().alloc_str(name), &self.builder)
+    }
+
+    fn number(&self, span: oxc_span::Span, value: f64) -> Expression<'a> {
+        Expression::new_numeric_literal(
+            span,
+            value,
+            None,
+            oxc_syntax::number::NumberBase::Decimal,
+            &self.builder,
+        )
+    }
+
+    fn numeric(expr: &Expression<'_>) -> Option<f64> {
+        match expr {
+            Expression::NumericLiteral(lit) => Some(lit.value),
+            _ => None,
+        }
+    }
+
+    fn js_i32(value: f64) -> i32 {
+        if !value.is_finite() || value == 0.0 { return 0; }
+        let n = value.trunc() as i64;
+        n as i32
+    }
+
+    fn fold_json(&self, value: &JsonValue, span: oxc_span::Span) -> Option<Expression<'a>> {
+        match value {
+            JsonValue::Null => Some(Expression::new_null_literal(span, &self.builder)),
+            JsonValue::Bool(value) => Some(Expression::new_boolean_literal(span, *value, &self.builder)),
+            JsonValue::Number(value) => value.as_f64().filter(|n| n.is_finite()).map(|n| self.number(span, n)),
+            JsonValue::String(value) => Some(Expression::new_string_literal(span, self.builder.allocator().alloc_str(value), None, &self.builder)),
+            JsonValue::Array(values) => {
+                let mut elements = ArenaVec::new_in(&self.builder);
+                for value in values {
+                    elements.push(self.fold_json(value, span)?.into());
+                }
+                Some(Expression::new_array_expression(span, elements, &self.builder))
+            }
+            JsonValue::Object(values) => {
+                let mut properties = ArenaVec::new_in(&self.builder);
+                for (key, value) in values {
+                    let value = self.fold_json(value, span)?;
+                    let key = PropertyKey::from(Expression::new_string_literal(span, self.builder.allocator().alloc_str(key), None, &self.builder));
+                    properties.push(ObjectPropertyKind::new_object_property(
+                        span, PropertyKind::Init, key, value, false, false, false, &self.builder,
+                    ));
+                }
+                Some(Expression::new_object_expression(span, properties, &self.builder))
+            }
+        }
+    }
+
+    fn fold(&self, expr: Expression<'a>) -> Expression<'a> {
+        let span = expr.span();
+        match &expr {
+            Expression::UnaryExpression(unary) => {
+                let unary = unary.as_ref();
+                match unary.operator {
+                    oxc_syntax::operator::UnaryOperator::LogicalNot => {
+                        if let Some(value) = Self::numeric(&unary.argument) {
+                            if value == 0.0 || value == 1.0 {
+                                return Expression::new_boolean_literal(span, value == 0.0, &self.builder);
+                            }
+                        }
+                    }
+                    oxc_syntax::operator::UnaryOperator::Void => {
+                        if matches!(&unary.argument, Expression::NumericLiteral(lit) if lit.value == 0.0)
+                            && !self.shadowed.contains("undefined")
+                        {
+                            return self.identifier(span, "undefined");
+                        }
+                    }
+                    oxc_syntax::operator::UnaryOperator::UnaryPlus => {
+                        if let Some(value) = Self::numeric(&unary.argument) {
+                            if !(value == 0.0 && value.is_sign_negative()) { return self.number(span, value); }
+                        }
+                    }
+                    oxc_syntax::operator::UnaryOperator::UnaryNegation => {
+                        if let Some(value) = Self::numeric(&unary.argument) {
+                            let value = -value;
+                            if !(value == 0.0 && value.is_sign_negative()) { return self.number(span, value); }
+                        }
+                    }
+                    oxc_syntax::operator::UnaryOperator::BitwiseNot => {
+                        if let Some(value) = Self::numeric(&unary.argument) {
+                            return self.number(span, f64::from(!Self::js_i32(value)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Expression::BinaryExpression(binary) => {
+                let binary = binary.as_ref();
+                let left = Self::numeric(&binary.left);
+                let right = Self::numeric(&binary.right);
+                if binary.operator == oxc_syntax::operator::BinaryOperator::Addition {
+                    if let (Expression::StringLiteral(left), Expression::StringLiteral(right)) = (&binary.left, &binary.right) {
+                        let mut value = left.value.to_string();
+                        value.push_str(right.value.as_str());
+                        return Expression::new_string_literal(span, self.builder.allocator().alloc_str(&value), None, &self.builder);
+                    }
+                }
+                if let (Some(left), Some(right)) = (left, right) {
+                    let value = match binary.operator {
+                        oxc_syntax::operator::BinaryOperator::Addition => left + right,
+                        oxc_syntax::operator::BinaryOperator::Subtraction => left - right,
+                        oxc_syntax::operator::BinaryOperator::Multiplication => left * right,
+                        oxc_syntax::operator::BinaryOperator::Division => {
+                            if right == 0.0 && !self.shadowed.contains("Infinity") {
+                                if left.is_sign_negative() { return Expression::new_unary_expression(span, oxc_syntax::operator::UnaryOperator::UnaryNegation, self.identifier(span, "Infinity"), &self.builder); }
+                                return self.identifier(span, "Infinity");
+                            }
+                            left / right
+                        }
+                        oxc_syntax::operator::BinaryOperator::Remainder => left % right,
+                        oxc_syntax::operator::BinaryOperator::Exponential => left.powf(right),
+                        oxc_syntax::operator::BinaryOperator::BitwiseOR => f64::from(Self::js_i32(left) | Self::js_i32(right)),
+                        oxc_syntax::operator::BinaryOperator::BitwiseXOR => f64::from(Self::js_i32(left) ^ Self::js_i32(right)),
+                        oxc_syntax::operator::BinaryOperator::BitwiseAnd => f64::from(Self::js_i32(left) & Self::js_i32(right)),
+                        oxc_syntax::operator::BinaryOperator::ShiftLeft => f64::from(Self::js_i32(left) << (Self::js_i32(right) & 31)),
+                        oxc_syntax::operator::BinaryOperator::ShiftRight => f64::from(Self::js_i32(left) >> (Self::js_i32(right) & 31)),
+                        oxc_syntax::operator::BinaryOperator::ShiftRightZeroFill => f64::from((Self::js_i32(left) as u32) >> (Self::js_i32(right) & 31)),
+                        _ => return expr,
+                    };
+                    if !(value == 0.0 && value.is_sign_negative()) && (value.is_finite() || value.is_infinite()) {
+                        return self.number(span, value);
+                    }
+                }
+            }
+            Expression::CallExpression(call) => {
+                if self.shadowed.contains("JSON") || call.arguments.len() != 1 { return expr; }
+                if let Expression::StaticMemberExpression(member) = &call.callee {
+                    if let Expression::Identifier(object) = &member.object {
+                        if object.name == "JSON" && member.property.name == "parse" && !call.optional {
+                            if let Some(Argument::StringLiteral(string)) = call.arguments.first() {
+                                if let Ok(value) = serde_json::from_str::<JsonValue>(string.value.as_str()) {
+                                    if let Some(replacement) = self.fold_json(&value, span) { return replacement; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        expr
+    }
+}
+
+impl<'a> VisitJsMut<'a> for LiteralUnminifier<'a> {
+    fn visit_binding_identifier(&mut self, it: &mut BindingIdentifier<'a>) {
+        self.shadowed.insert(it.name.to_string());
+    }
+
+    fn visit_expression(&mut self, it: &mut Expression<'a>) {
+        oxc_ast_visit::walk_js_mut::walk_expression(self, it);
+        it.replace_with(|expr| self.fold(expr));
+    }
+}
+
+fn unminify_program<'a>(allocator: &'a Allocator, program: &mut Program<'a>) {
+    // Build Oxc's semantic model as the scope-analysis boundary. The visitor
+    // additionally records every binding, conservatively covering nested scopes.
+    let _ = SemanticBuilder::new_compiler().build(program);
+    let mut pass = LiteralUnminifier::new(allocator, HashSet::new());
+    pass.visit_program(program);
 }
 
 fn bookmarklet_source(source: &str) -> String {
     source.strip_prefix("javascript:").unwrap_or(source).to_string()
 }
 
-fn parse_and_generate(source: &str, filename: Option<&str>, source_type: &str, minify: bool) -> PyResult<(String, Vec<String>)> {
+fn parse_and_generate(source: &str, filename: Option<&str>, source_type: &str, minify: bool, apply_unminify: bool) -> PyResult<(String, Vec<String>)> {
     let allocator = Allocator::default();
     let ty = source_type_for(filename, source_type)?;
     let parsed = Parser::new(&allocator, source, ty)
@@ -55,6 +232,9 @@ fn parse_and_generate(source: &str, filename: Option<&str>, source_type: &str, m
         return Err(PySyntaxError::new_err(diagnostics.join("\n")));
     }
     let mut program = parsed.program;
+    if apply_unminify {
+        unminify_program(&allocator, &mut program);
+    }
     if minify {
         Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
     }
@@ -168,8 +348,7 @@ impl Result {
 #[pyo3(signature = (source, *, filename=None, source_type="auto", minify=false))]
 pub fn transform(source: &str, filename: Option<&str>, source_type: &str, minify: bool) -> PyResult<Result> {
     let source = bookmarklet_source(source);
-    let source = unminify_source(source);
-    let (code, diagnostics) = parse_and_generate(&source, filename, source_type, minify)?;
+    let (code, diagnostics) = parse_and_generate(&source, filename, source_type, minify, true)?;
     Ok(Result { code, bundle: None, diagnostics })
 }
 
@@ -182,15 +361,15 @@ pub fn format(source: &str, filename: Option<&str>, source_type: &str) -> PyResu
 #[pyfunction]
 #[pyo3(signature = (source, *, filename=None, source_type="auto"))]
 pub fn minify(source: &str, filename: Option<&str>, source_type: &str) -> PyResult<String> {
-    let source = unminify_source(bookmarklet_source(source));
-    Ok(parse_and_generate(&source, filename, source_type, true)?.0)
+    let source = bookmarklet_source(source);
+    Ok(parse_and_generate(&source, filename, source_type, true, true)?.0)
 }
 
 #[pyfunction]
 #[pyo3(signature = (source, *, filename=None, source_type="auto"))]
 pub fn unminify(source: &str, filename: Option<&str>, source_type: &str) -> PyResult<String> {
-    let source = unminify_source(bookmarklet_source(source));
-    Ok(parse_and_generate(&source, filename, source_type, false)?.0)
+    let source = bookmarklet_source(source);
+    Ok(parse_and_generate(&source, filename, source_type, false, true)?.0)
 }
 
 #[pyfunction]
@@ -207,7 +386,7 @@ pub fn unpack(source: &str) -> PyResult<Option<Bundle>> {
         Some(value) => value,
         None => return Ok(None),
     };
-    let (code, _) = parse_and_generate(&normalized, None, "auto", false)?;
+    let (code, _) = parse_and_generate(&normalized, None, "auto", false, false)?;
     Ok(Some(Bundle {
         bundle_type,
         entry_id,
@@ -231,9 +410,8 @@ pub fn webcrack(source: &str, options: Option<&Bound<'_, PyDict>>) -> PyResult<R
         if let Some(value) = opts.get_item("mangle")? { mangle = value.extract()?; }
     }
     let normalized = bookmarklet_source(source);
-    let prepared = if unminify { unminify_source(normalized) } else { normalized };
-    let (code, diagnostics) = parse_and_generate(&prepared, None, "auto", mangle)?;
-    let bundle = if unpack && deobfuscate { detect_bundle(&prepared).map(|(bundle_type, entry_id)| Bundle {
+    let (code, diagnostics) = parse_and_generate(&normalized, None, "auto", mangle, unminify)?;
+    let bundle = if unpack && deobfuscate { detect_bundle(&normalized).map(|(bundle_type, entry_id)| Bundle {
         bundle_type,
         entry_id,
         modules: vec![Module { id: "0".to_string(), path: "./index.js".to_string(), code: code.clone(), is_entry: true }],
