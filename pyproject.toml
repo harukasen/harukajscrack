@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "webscrack"
+version = "0.1.0"
+description = "Fast JavaScript/TypeScript formatting and minification powered by Rust and Oxc"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "webscrack contributors" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Compilers",
+]
+
+[project.scripts]
+webscrack = "webscrack.__main__:main"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "webscrack._native"
+python-source = "."
+features = ["pyo3/extension-module"]

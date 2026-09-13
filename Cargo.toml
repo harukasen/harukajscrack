@@ -1,0 +1,25 @@
+[package]
+name = "webscrack"
+version = "0.1.0"
+edition = "2021"
+description = "Fast JavaScript/TypeScript formatting and minification powered by Oxc"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29.0", features = ["extension-module"] }
+oxc_allocator = "0.149.0"
+oxc_codegen = "0.149.0"
+oxc_minifier = "0.149.0"
+oxc_parser = "0.149.0"
+oxc_span = "0.149.0"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+strip = true
