@@ -186,6 +186,35 @@ pub fn minify(source: &str, filename: Option<&str>, source_type: &str) -> PyResu
     Ok(parse_and_generate(&source, filename, source_type, true)?.0)
 }
 
+#[pyfunction]
+#[pyo3(signature = (source, *, filename=None, source_type="auto"))]
+pub fn unminify(source: &str, filename: Option<&str>, source_type: &str) -> PyResult<String> {
+    let source = unminify_source(bookmarklet_source(source));
+    Ok(parse_and_generate(&source, filename, source_type, false)?.0)
+}
+
+#[pyfunction]
+#[pyo3(signature = (source, *, filename=None, source_type="auto"))]
+pub fn deobfuscate(source: &str, filename: Option<&str>, source_type: &str) -> PyResult<String> {
+    unminify(source, filename, source_type)
+}
+
+#[pyfunction]
+#[pyo3(signature = (source))]
+pub fn unpack(source: &str) -> PyResult<Option<Bundle>> {
+    let normalized = bookmarklet_source(source);
+    let (bundle_type, entry_id) = match detect_bundle(&normalized) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let (code, _) = parse_and_generate(&normalized, None, "auto", false)?;
+    Ok(Some(Bundle {
+        bundle_type,
+        entry_id,
+        modules: vec![Module { id: "0".to_string(), path: "./index.js".to_string(), code, is_entry: true }],
+    }))
+}
+
 /// Compatibility-oriented equivalent of upstream `webcrack(code, options)`.
 /// Options are a Python dict: jsx, unpack, deobfuscate, unminify, and mangle.
 #[pyfunction]
@@ -220,6 +249,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(transform, m)?)?;
     m.add_function(wrap_pyfunction!(format, m)?)?;
     m.add_function(wrap_pyfunction!(minify, m)?)?;
+    m.add_function(wrap_pyfunction!(unminify, m)?)?;
+    m.add_function(wrap_pyfunction!(deobfuscate, m)?)?;
+    m.add_function(wrap_pyfunction!(unpack, m)?)?;
     m.add_function(wrap_pyfunction!(webcrack, m)?)?;
     let _ = PyList::empty(m.py());
     Ok(())

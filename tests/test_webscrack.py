@@ -27,6 +27,12 @@ def test_webcrack_compatibility_options():
     assert result.bundle is None
 
 
+def test_public_pipeline_entry_points():
+    assert "true" in webscrack.unminify("const flag=!0;")
+    assert "true" in webscrack.deobfuscate("const flag=!0;")
+    assert webscrack.unpack("const x = 1;") is None
+
+
 def test_bundle_detection_and_save(tmp_path: Path):
     result = webscrack.webcrack("var __webpack_modules__ = {};", {})
     assert result.bundle is not None
