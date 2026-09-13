@@ -403,11 +403,11 @@ fn find_arrays(source: &str) -> Vec<ArrayDef> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        let kw = if source[i..].starts_with("const") {
+        let kw = if b[i..].starts_with(b"const") {
             "const"
-        } else if source[i..].starts_with("let") {
+        } else if b[i..].starts_with(b"let") {
             "let"
-        } else if source[i..].starts_with("var") {
+        } else if b[i..].starts_with(b"var") {
             "var"
         } else {
             i += 1;
