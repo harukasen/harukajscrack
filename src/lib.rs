@@ -29,7 +29,9 @@ fn source_type_for(filename: Option<&str>, source_type: &str) -> PyResult<Source
         "mjs" => Ok(SourceType::mjs()),
         "cjs" => Ok(SourceType::cjs()),
         "auto" => filename
-            .map(|name| SourceType::from_path(name).map_err(|e| PyValueError::new_err(e.to_string())))
+            .map(|name| {
+                SourceType::from_path(name).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
             .unwrap_or_else(|| Ok(SourceType::default())),
         other => Err(PyValueError::new_err(format!(
             "unsupported source_type {other:?}; use js, jsx, ts, tsx, mjs, cjs, or auto"
@@ -50,11 +52,18 @@ struct LiteralUnminifier<'a> {
 
 impl<'a> LiteralUnminifier<'a> {
     fn new(allocator: &'a Allocator, shadowed: HashSet<String>) -> Self {
-        Self { builder: AstBuilder::new(allocator), shadowed }
+        Self {
+            builder: AstBuilder::new(allocator),
+            shadowed,
+        }
     }
 
     fn identifier(&self, span: oxc_span::Span, name: &str) -> Expression<'a> {
-        Expression::new_identifier(span, self.builder.allocator().alloc_str(name), &self.builder)
+        Expression::new_identifier(
+            span,
+            self.builder.allocator().alloc_str(name),
+            &self.builder,
+        )
     }
 
     fn number(&self, span: oxc_span::Span, value: f64) -> Expression<'a> {
@@ -75,7 +84,9 @@ impl<'a> LiteralUnminifier<'a> {
     }
 
     fn js_i32(value: f64) -> i32 {
-        if !value.is_finite() || value == 0.0 { return 0; }
+        if !value.is_finite() || value == 0.0 {
+            return 0;
+        }
         let n = value.trunc() as i64;
         n as i32
     }
@@ -83,26 +94,56 @@ impl<'a> LiteralUnminifier<'a> {
     fn fold_json(&self, value: &JsonValue, span: oxc_span::Span) -> Option<Expression<'a>> {
         match value {
             JsonValue::Null => Some(Expression::new_null_literal(span, &self.builder)),
-            JsonValue::Bool(value) => Some(Expression::new_boolean_literal(span, *value, &self.builder)),
-            JsonValue::Number(value) => value.as_f64().filter(|n| n.is_finite()).map(|n| self.number(span, n)),
-            JsonValue::String(value) => Some(Expression::new_string_literal(span, self.builder.allocator().alloc_str(value), None, &self.builder)),
+            JsonValue::Bool(value) => {
+                Some(Expression::new_boolean_literal(span, *value, &self.builder))
+            }
+            JsonValue::Number(value) => value
+                .as_f64()
+                .filter(|n| n.is_finite())
+                .map(|n| self.number(span, n)),
+            JsonValue::String(value) => Some(Expression::new_string_literal(
+                span,
+                self.builder.allocator().alloc_str(value),
+                None,
+                &self.builder,
+            )),
             JsonValue::Array(values) => {
                 let mut elements = ArenaVec::new_in(&self.builder);
                 for value in values {
                     elements.push(self.fold_json(value, span)?.into());
                 }
-                Some(Expression::new_array_expression(span, elements, &self.builder))
+                Some(Expression::new_array_expression(
+                    span,
+                    elements,
+                    &self.builder,
+                ))
             }
             JsonValue::Object(values) => {
                 let mut properties = ArenaVec::new_in(&self.builder);
                 for (key, value) in values {
                     let value = self.fold_json(value, span)?;
-                    let key = PropertyKey::from(Expression::new_string_literal(span, self.builder.allocator().alloc_str(key), None, &self.builder));
+                    let key = PropertyKey::from(Expression::new_string_literal(
+                        span,
+                        self.builder.allocator().alloc_str(key),
+                        None,
+                        &self.builder,
+                    ));
                     properties.push(ObjectPropertyKind::new_object_property(
-                        span, PropertyKind::Init, key, value, false, false, false, &self.builder,
+                        span,
+                        PropertyKind::Init,
+                        key,
+                        value,
+                        false,
+                        false,
+                        false,
+                        &self.builder,
                     ));
                 }
-                Some(Expression::new_object_expression(span, properties, &self.builder))
+                Some(Expression::new_object_expression(
+                    span,
+                    properties,
+                    &self.builder,
+                ))
             }
         }
     }
@@ -116,7 +157,11 @@ impl<'a> LiteralUnminifier<'a> {
                     oxc_syntax::operator::UnaryOperator::LogicalNot => {
                         if let Some(value) = Self::numeric(&unary.argument) {
                             if value == 0.0 || value == 1.0 {
-                                return Expression::new_boolean_literal(span, value == 0.0, &self.builder);
+                                return Expression::new_boolean_literal(
+                                    span,
+                                    value == 0.0,
+                                    &self.builder,
+                                );
                             }
                         }
                     }
@@ -129,13 +174,17 @@ impl<'a> LiteralUnminifier<'a> {
                     }
                     oxc_syntax::operator::UnaryOperator::UnaryPlus => {
                         if let Some(value) = Self::numeric(&unary.argument) {
-                            if !(value == 0.0 && value.is_sign_negative()) { return self.number(span, value); }
+                            if !(value == 0.0 && value.is_sign_negative()) {
+                                return self.number(span, value);
+                            }
                         }
                     }
                     oxc_syntax::operator::UnaryOperator::UnaryNegation => {
                         if let Some(value) = Self::numeric(&unary.argument) {
                             let value = -value;
-                            if !(value == 0.0 && value.is_sign_negative()) { return self.number(span, value); }
+                            if !(value == 0.0 && value.is_sign_negative()) {
+                                return self.number(span, value);
+                            }
                         }
                     }
                     oxc_syntax::operator::UnaryOperator::BitwiseNot => {
@@ -151,10 +200,17 @@ impl<'a> LiteralUnminifier<'a> {
                 let left = Self::numeric(&binary.left);
                 let right = Self::numeric(&binary.right);
                 if binary.operator == oxc_syntax::operator::BinaryOperator::Addition {
-                    if let (Expression::StringLiteral(left), Expression::StringLiteral(right)) = (&binary.left, &binary.right) {
+                    if let (Expression::StringLiteral(left), Expression::StringLiteral(right)) =
+                        (&binary.left, &binary.right)
+                    {
                         let mut value = left.value.to_string();
                         value.push_str(right.value.as_str());
-                        return Expression::new_string_literal(span, self.builder.allocator().alloc_str(&value), None, &self.builder);
+                        return Expression::new_string_literal(
+                            span,
+                            self.builder.allocator().alloc_str(&value),
+                            None,
+                            &self.builder,
+                        );
                     }
                 }
                 if let (Some(left), Some(right)) = (left, right) {
@@ -164,34 +220,64 @@ impl<'a> LiteralUnminifier<'a> {
                         oxc_syntax::operator::BinaryOperator::Multiplication => left * right,
                         oxc_syntax::operator::BinaryOperator::Division => {
                             if right == 0.0 && !self.shadowed.contains("Infinity") {
-                                if left.is_sign_negative() { return Expression::new_unary_expression(span, oxc_syntax::operator::UnaryOperator::UnaryNegation, self.identifier(span, "Infinity"), &self.builder); }
+                                if left.is_sign_negative() {
+                                    return Expression::new_unary_expression(
+                                        span,
+                                        oxc_syntax::operator::UnaryOperator::UnaryNegation,
+                                        self.identifier(span, "Infinity"),
+                                        &self.builder,
+                                    );
+                                }
                                 return self.identifier(span, "Infinity");
                             }
                             left / right
                         }
                         oxc_syntax::operator::BinaryOperator::Remainder => left % right,
                         oxc_syntax::operator::BinaryOperator::Exponential => left.powf(right),
-                        oxc_syntax::operator::BinaryOperator::BitwiseOR => f64::from(Self::js_i32(left) | Self::js_i32(right)),
-                        oxc_syntax::operator::BinaryOperator::BitwiseXOR => f64::from(Self::js_i32(left) ^ Self::js_i32(right)),
-                        oxc_syntax::operator::BinaryOperator::BitwiseAnd => f64::from(Self::js_i32(left) & Self::js_i32(right)),
-                        oxc_syntax::operator::BinaryOperator::ShiftLeft => f64::from(Self::js_i32(left) << (Self::js_i32(right) & 31)),
-                        oxc_syntax::operator::BinaryOperator::ShiftRight => f64::from(Self::js_i32(left) >> (Self::js_i32(right) & 31)),
-                        oxc_syntax::operator::BinaryOperator::ShiftRightZeroFill => f64::from((Self::js_i32(left) as u32) >> (Self::js_i32(right) & 31)),
+                        oxc_syntax::operator::BinaryOperator::BitwiseOR => {
+                            f64::from(Self::js_i32(left) | Self::js_i32(right))
+                        }
+                        oxc_syntax::operator::BinaryOperator::BitwiseXOR => {
+                            f64::from(Self::js_i32(left) ^ Self::js_i32(right))
+                        }
+                        oxc_syntax::operator::BinaryOperator::BitwiseAnd => {
+                            f64::from(Self::js_i32(left) & Self::js_i32(right))
+                        }
+                        oxc_syntax::operator::BinaryOperator::ShiftLeft => {
+                            f64::from(Self::js_i32(left) << (Self::js_i32(right) & 31))
+                        }
+                        oxc_syntax::operator::BinaryOperator::ShiftRight => {
+                            f64::from(Self::js_i32(left) >> (Self::js_i32(right) & 31))
+                        }
+                        oxc_syntax::operator::BinaryOperator::ShiftRightZeroFill => {
+                            f64::from((Self::js_i32(left) as u32) >> (Self::js_i32(right) & 31))
+                        }
                         _ => return expr,
                     };
-                    if !(value == 0.0 && value.is_sign_negative()) && (value.is_finite() || value.is_infinite()) {
+                    if !(value == 0.0 && value.is_sign_negative())
+                        && (value.is_finite() || value.is_infinite())
+                    {
                         return self.number(span, value);
                     }
                 }
             }
             Expression::CallExpression(call) => {
-                if self.shadowed.contains("JSON") || call.arguments.len() != 1 { return expr; }
+                if self.shadowed.contains("JSON") || call.arguments.len() != 1 {
+                    return expr;
+                }
                 if let Expression::StaticMemberExpression(member) = &call.callee {
                     if let Expression::Identifier(object) = &member.object {
-                        if object.name == "JSON" && member.property.name == "parse" && !call.optional {
+                        if object.name == "JSON"
+                            && member.property.name == "parse"
+                            && !call.optional
+                        {
                             if let Some(Argument::StringLiteral(string)) = call.arguments.first() {
-                                if let Ok(value) = serde_json::from_str::<JsonValue>(string.value.as_str()) {
-                                    if let Some(replacement) = self.fold_json(&value, span) { return replacement; }
+                                if let Ok(value) =
+                                    serde_json::from_str::<JsonValue>(string.value.as_str())
+                                {
+                                    if let Some(replacement) = self.fold_json(&value, span) {
+                                        return replacement;
+                                    }
                                 }
                             }
                         }
@@ -227,11 +313,20 @@ fn bookmarklet_source(source: &str) -> String {
     ast_utils::normalize_bookmarklet(source)
 }
 
-fn parse_and_generate(source: &str, filename: Option<&str>, source_type: &str, minify: bool, apply_unminify: bool) -> PyResult<(String, Vec<String>)> {
+fn parse_and_generate(
+    source: &str,
+    filename: Option<&str>,
+    source_type: &str,
+    minify: bool,
+    apply_unminify: bool,
+) -> PyResult<(String, Vec<String>)> {
     let allocator = Allocator::default();
     let ty = source_type_for(filename, source_type)?;
     let parsed = Parser::new(&allocator, source, ty)
-        .with_options(ParseOptions { parse_regular_expression: true, ..ParseOptions::default() })
+        .with_options(ParseOptions {
+            parse_regular_expression: true,
+            ..ParseOptions::default()
+        })
         .parse();
     let diagnostics: Vec<String> = parsed.diagnostics.iter().map(|d| d.to_string()).collect();
     if parsed.fatal_error || !diagnostics.is_empty() {
@@ -245,7 +340,10 @@ fn parse_and_generate(source: &str, filename: Option<&str>, source_type: &str, m
         Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
     }
     let output = Codegen::new()
-        .with_options(CodegenOptions { minify, ..CodegenOptions::default() })
+        .with_options(CodegenOptions {
+            minify,
+            ..CodegenOptions::default()
+        })
         .build(&program);
     Ok((output.code, diagnostics))
 }
@@ -281,7 +379,11 @@ pub struct Bundle {
 #[pymethods]
 impl Bundle {
     pub fn __repr__(&self) -> String {
-        format!("Bundle(type={:?}, modules={})", self.bundle_type, self.modules.len())
+        format!(
+            "Bundle(type={:?}, modules={})",
+            self.bundle_type,
+            self.modules.len()
+        )
     }
 
     pub fn save(&self, directory: &str) -> PyResult<()> {
@@ -291,14 +393,21 @@ impl Bundle {
             "{{\n  \"type\": {:?},\n  \"entryId\": {:?},\n  \"modules\": [{}]\n}}\n",
             self.bundle_type,
             self.entry_id,
-            self.modules.iter().map(|m| format!("{{\"id\": {:?}, \"path\": {:?}}}", m.id, m.path)).collect::<Vec<_>>().join(", ")
+            self.modules
+                .iter()
+                .map(|m| format!("{{\"id\": {:?}, \"path\": {:?}}}", m.id, m.path))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        fs::write(root.join("bundle.json"), metadata).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        fs::write(root.join("bundle.json"), metadata)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         for module in &self.modules {
             let relative = module.path.trim_start_matches("./");
             let path = root.join(PathBuf::from(relative));
             if path.strip_prefix(root).is_err() {
-                return Err(PyValueError::new_err("bundle module path traversal detected"));
+                return Err(PyValueError::new_err(
+                    "bundle module path traversal detected",
+                ));
             }
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -333,16 +442,29 @@ impl Result {
     }
 
     fn __repr__(&self) -> String {
-        format!("Result(code_len={}, bundle={})", self.code.len(), self.bundle.is_some())
+        format!(
+            "Result(code_len={}, bundle={})",
+            self.code.len(),
+            self.bundle.is_some()
+        )
     }
 }
 
 #[pyfunction]
 #[pyo3(signature = (source, *, filename=None, source_type="auto", minify=false))]
-pub fn transform(source: &str, filename: Option<&str>, source_type: &str, minify: bool) -> PyResult<Result> {
+pub fn transform(
+    source: &str,
+    filename: Option<&str>,
+    source_type: &str,
+    minify: bool,
+) -> PyResult<Result> {
     let source = bookmarklet_source(source);
     let (code, diagnostics) = parse_and_generate(&source, filename, source_type, minify, true)?;
-    Ok(Result { code, bundle: None, diagnostics })
+    Ok(Result {
+        code,
+        bundle: None,
+        diagnostics,
+    })
 }
 
 #[pyfunction]
@@ -369,6 +491,7 @@ pub fn unminify(source: &str, filename: Option<&str>, source_type: &str) -> PyRe
 #[pyo3(signature = (source, *, filename=None, source_type="auto"))]
 pub fn deobfuscate(source: &str, filename: Option<&str>, source_type: &str) -> PyResult<String> {
     let source = deobfuscate_utils::strip_debugger_statements(&bookmarklet_source(source));
+    let source = deobfuscate_utils::static_deobfuscate(&source);
     unminify(&source, filename, source_type)
 }
 
@@ -384,7 +507,12 @@ pub fn unpack(source: &str) -> PyResult<Option<Bundle>> {
     Ok(Some(Bundle {
         bundle_type,
         entry_id,
-        modules: vec![Module { id: "0".to_string(), path: "./index.js".to_string(), code, is_entry: true }],
+        modules: vec![Module {
+            id: "0".to_string(),
+            path: "./index.js".to_string(),
+            code,
+            is_entry: true,
+        }],
     }))
 }
 
@@ -398,19 +526,45 @@ pub fn webcrack(source: &str, options: Option<&Bound<'_, PyDict>>) -> PyResult<R
     let mut deobfuscate = true;
     let mut mangle = false;
     if let Some(opts) = options {
-        if let Some(value) = opts.get_item("unminify")? { unminify = value.extract()?; }
-        if let Some(value) = opts.get_item("unpack")? { unpack = value.extract()?; }
-        if let Some(value) = opts.get_item("deobfuscate")? { deobfuscate = value.extract()?; }
-        if let Some(value) = opts.get_item("mangle")? { mangle = value.extract()?; }
+        if let Some(value) = opts.get_item("unminify")? {
+            unminify = value.extract()?;
+        }
+        if let Some(value) = opts.get_item("unpack")? {
+            unpack = value.extract()?;
+        }
+        if let Some(value) = opts.get_item("deobfuscate")? {
+            deobfuscate = value.extract()?;
+        }
+        if let Some(value) = opts.get_item("mangle")? {
+            mangle = value.extract()?;
+        }
     }
     let normalized = bookmarklet_source(source);
+    let normalized = if deobfuscate {
+        deobfuscate_utils::static_deobfuscate(&normalized)
+    } else {
+        normalized
+    };
     let (code, diagnostics) = parse_and_generate(&normalized, None, "auto", mangle, unminify)?;
-    let bundle = if unpack && deobfuscate { detect_bundle(&normalized).map(|(bundle_type, entry_id)| Bundle {
-        bundle_type,
-        entry_id,
-        modules: vec![Module { id: "0".to_string(), path: "./index.js".to_string(), code: code.clone(), is_entry: true }],
-    }) } else { None };
-    Ok(Result { code, bundle, diagnostics })
+    let bundle = if unpack && deobfuscate {
+        detect_bundle(&normalized).map(|(bundle_type, entry_id)| Bundle {
+            bundle_type,
+            entry_id,
+            modules: vec![Module {
+                id: "0".to_string(),
+                path: "./index.js".to_string(),
+                code: code.clone(),
+                is_entry: true,
+            }],
+        })
+    } else {
+        None
+    };
+    Ok(Result {
+        code,
+        bundle,
+        diagnostics,
+    })
 }
 
 #[pymodule]
