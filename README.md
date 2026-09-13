@@ -4,6 +4,8 @@
 
 The Rust implementation follows the upstream option surface (`jsx`, `unpack`, `deobfuscate`, `unminify`, and `mangle`) and returns `Result`/`Bundle`/`Module` objects with `save()` methods. Oxc provides the safe parser, generator, and minifier core. Runtime-assisted obfuscator decoding and full webpack/browserify module extraction remain separate follow-up work; bundle detection is included and safely materializes the input as an entry module.
 
+The Rust source is organized into the corresponding implementation areas: `src/ast_utils.rs` contains shared AST/path/bookmarklet helpers, `src/deobfuscate.rs` contains non-executing decoder and debug-cleanup helpers, and `src/unpack.rs` contains webpack/Browserify detection and module-path helpers. These modules are wired into the native API and covered by Rust unit tests. They are the safe foundation for the remaining visitor-by-visitor parity work; they do not claim to execute arbitrary upstream `isolated-vm` decoder code.
+
 ## Install
 
 From a checkout:

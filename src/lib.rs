@@ -14,6 +14,12 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod ast_utils;
+#[path = "deobfuscate.rs"]
+mod deobfuscate_utils;
+#[path = "unpack.rs"]
+mod unpack_utils;
+
 fn source_type_for(filename: Option<&str>, source_type: &str) -> PyResult<SourceType> {
     match source_type {
         "js" | "javascript" => Ok(SourceType::default()),
@@ -218,7 +224,7 @@ fn unminify_program<'a>(allocator: &'a Allocator, program: &mut Program<'a>) {
 }
 
 fn bookmarklet_source(source: &str) -> String {
-    source.strip_prefix("javascript:").unwrap_or(source).to_string()
+    ast_utils::normalize_bookmarklet(source)
 }
 
 fn parse_and_generate(source: &str, filename: Option<&str>, source_type: &str, minify: bool, apply_unminify: bool) -> PyResult<(String, Vec<String>)> {
@@ -245,20 +251,7 @@ fn parse_and_generate(source: &str, filename: Option<&str>, source_type: &str, m
 }
 
 fn detect_bundle(source: &str) -> Option<(String, String)> {
-    if source.contains("__webpack_modules__")
-        || source.contains("webpackJsonp")
-        || source.contains("webpackBootstrap")
-        || source.contains("__webpack_require__")
-    {
-        return Some(("webpack".to_string(), "0".to_string()));
-    }
-    if source.contains("function(require,module,exports)")
-        || source.contains("function (require, module, exports)")
-        || source.contains("browserify")
-    {
-        return Some(("browserify".to_string(), "0".to_string()));
-    }
-    None
+    unpack_utils::detect(source).map(|bundle| (bundle.kind, bundle.entry_id))
 }
 
 #[pyclass]
@@ -375,7 +368,8 @@ pub fn unminify(source: &str, filename: Option<&str>, source_type: &str) -> PyRe
 #[pyfunction]
 #[pyo3(signature = (source, *, filename=None, source_type="auto"))]
 pub fn deobfuscate(source: &str, filename: Option<&str>, source_type: &str) -> PyResult<String> {
-    unminify(source, filename, source_type)
+    let source = deobfuscate_utils::strip_debugger_statements(&bookmarklet_source(source));
+    unminify(&source, filename, source_type)
 }
 
 #[pyfunction]
