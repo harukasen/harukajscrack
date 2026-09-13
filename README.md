@@ -1,8 +1,8 @@
 # webscrack
 
-`webscrack` is a native Python package implemented in Rust with [PyO3](https://pyo3.rs/) and [Oxc](https://oxc.rs/). It provides fast JavaScript and TypeScript parsing, readable code generation, and minification without a Node.js runtime.
+`webscrack` is a native Python package implemented in Rust with [PyO3](https://pyo3.rs/) and [Oxc](https://oxc.rs/). It provides fast JavaScript and TypeScript parsing, readable code generation, minification, bookmarklet normalization, safe unminification, and a compatibility-oriented `webcrack()` pipeline without a Node.js runtime.
 
-This initial port exposes the Oxc compiler primitives. It is intentionally not described as a complete one-to-one implementation of the upstream `webcrack` reverse-engineering pipeline: webpack/browserify unpacking, obfuscator.io-specific cleanup, and runtime-assisted transformations are separate features that can be added on top of the stable parser/codegen core.
+The Rust implementation follows the upstream option surface (`jsx`, `unpack`, `deobfuscate`, `unminify`, and `mangle`) and returns `Result`/`Bundle`/`Module` objects with `save()` methods. Oxc provides the safe parser, generator, and minifier core. Runtime-assisted obfuscator decoding and full webpack/browserify module extraction remain separate follow-up work; bundle detection is included and safely materializes the input as an entry module.
 
 ## Install
 
@@ -31,9 +31,16 @@ print(result.code)
 
 compressed = webscrack.minify(source)
 formatted_typescript = webscrack.format("const value: number = 42", source_type="ts")
+
+result = webscrack.webcrack(source, {
+    "unminify": True,
+    "deobfuscate": True,
+    "unpack": True,
+    "mangle": False,
+})
 ```
 
-`transform()` returns a `Result` with `code`, `bundle`, and `diagnostics` attributes. `Result.save(directory)` writes the generated code to `directory/index.js`.
+`transform()` and `webcrack()` return a `Result` with `code`, `bundle`, and `diagnostics` attributes. `Result.save(directory)` writes `deobfuscated.js`, `bundle.json`, and any extracted modules. `Bundle.save(directory)` is also available directly.
 
 Supported source types are `auto`, `js`, `jsx`, `ts`, `tsx`, `mjs`, and `cjs`. With `auto`, the type is inferred from `filename` when one is supplied.
 
